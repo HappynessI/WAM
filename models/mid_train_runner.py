@@ -18,7 +18,7 @@ from torchvision.transforms import Normalize
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
 from peft import get_peft_model, LoraConfig
-from typing import List 
+from typing import List
 
 MAIN_VISION_ENCODER_MEAN = [0.5, 0.5, 0.5]
 MAIN_VISION_ENCODER_STD = [0.5, 0.5, 0.5]
@@ -31,11 +31,11 @@ def mean_flat(x):
 def preprocess_raw_image(x, enc_type):
     mean = torch.tensor(MAIN_VISION_ENCODER_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
     std = torch.tensor(MAIN_VISION_ENCODER_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-    
+
     x_denormalized = x * std + mean
 
     x_raw = x_denormalized * 255.0
-    
+
     x = torch.clamp(x_raw, 0, 255)
 
     resolution = x.shape[-1]
@@ -47,7 +47,7 @@ def preprocess_raw_image(x, enc_type):
     elif 'dinov2' in enc_type:
         x = x / 255.
         #keep consistent with the official version
-        x = Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)(x) 
+        x = Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)(x)
         x = torch.nn.functional.interpolate(x, 224 * (resolution // 256), mode='bicubic')
     elif 'theia' in enc_type:
         return x
@@ -57,6 +57,30 @@ def preprocess_raw_image(x, enc_type):
         x = Normalize(MAIN_VISION_ENCODER_MEAN, MAIN_VISION_ENCODER_STD)(x)
         x = torch.nn.functional.interpolate(x, 224 * (resolution // 256), mode='bicubic')
     return x
+
+class TcpMapEncoder(nn.Module):
+    def __init__(self, in_channels=4, token_dim=1152, out_tokens=196):
+        super().__init__()
+        self.out_tokens = out_tokens
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=5, stride=2, padding=2),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.SiLU(),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(16, 256),
+            nn.SiLU(),
+            nn.Conv2d(256, token_dim, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+        )
+
+    def forward(self, x):
+        x = self.net(x)
+        x = F.adaptive_avg_pool2d(x, (14, 14))
+        return x.flatten(2).transpose(1, 2)
+
 
 class RDTRunner(nn.Module,
                 CompatiblePyTorchModelHubMixin):
@@ -78,14 +102,29 @@ class RDTRunner(nn.Module,
                  resolution=256,
                  accelerator=None,
                  learnable_tokens=None,
+                 wm_input_type: str = "future_image",
+                 wm_target_type: str = "future_image",
+                 tcp_history_size: int = 2,
+                 future_bins: int = 10,
+                 heatmap_loss_weight: float = 1.0,
+                 depth_loss_weight: float = 0.5,
                  use_lora: bool = False,
                  lora_config: Optional[Dict[str, Any]] = None):
         super(RDTRunner, self).__init__()
 
         self.accelerator = accelerator
         self.learnable_tokens = learnable_tokens
+        self.wm_input_type = wm_input_type
+        self.wm_target_type = wm_target_type
+        self.tcp_history_size = tcp_history_size
+        self.future_bins = future_bins
+        self.heatmap_loss_weight = heatmap_loss_weight
+        self.depth_loss_weight = depth_loss_weight
         hidden_size = 2048
-        if enc_type != None:
+        self.encoders, self.encoder_types, self.architectures = [], [], []
+        if wm_target_type == "future_image":
+            if enc_type is None:
+                raise NotImplementedError()
             self.encoders, self.encoder_types, self.architectures = load_encoders(enc_type, accelerator.device, resolution)
             self.encoders = [encoder.to(torch.bfloat16) for encoder in self.encoders]
 
@@ -93,9 +132,7 @@ class RDTRunner(nn.Module,
             for encoder in self.encoders:
                 encoder.requires_grad_(False)
                 encoder.eval()
-        else:
-            raise NotImplementedError()
-        target_dims = [encoder.embed_dim for encoder in self.encoders] if enc_type != 'None' else [0]
+        target_dims = [encoder.embed_dim for encoder in self.encoders] if self.encoders else [0]
 
 
         self.model = RDT(
@@ -126,6 +163,11 @@ class RDTRunner(nn.Module,
             config['state_adaptor'],
             in_features=state_token_dim * 2,  # state + state mask (indicator)
             out_features=hidden_size)
+        self.tcp_map_encoder = TcpMapEncoder(
+            in_channels=tcp_history_size * 2,
+            token_dim=img_token_dim,
+            out_tokens=learnable_tokens or 196,
+        )
 
         # Create the noise scheduler
         noise_scheduler_config = config['noise_scheduler']
@@ -172,7 +214,7 @@ class RDTRunner(nn.Module,
         lang_tokens: (batch_size, lang_len, lang_token_dim)
         img_tokens: (batch_size, img_len, img_token_dim)
         state_tokens: (batch_size, state_len, state_token_dim)
-        
+
         return: adpated (..., hidden_size) for all input tokens
         '''
         adpated_lang = self.lang_adaptor(lang_tokens)
@@ -180,6 +222,9 @@ class RDTRunner(nn.Module,
         adpated_state = self.state_adaptor(state_tokens)
 
         return adpated_lang, adpated_img, adpated_state
+
+    def encode_tcp_maps(self, tcp_maps):
+        return self.tcp_map_encoder(tcp_maps)
 
     def conditional_sample(self, lang_cond, lang_attn_mask, img_cond, state_traj, action_mask, ctrl_freqs):
         '''
@@ -191,7 +236,7 @@ class RDTRunner(nn.Module,
         action_mask: (batch_size, 1, action_dim), a 0-1 **float** tensor
             indicating the valid action dimensions.
         ctrl_freqs: (batch_size,), control frequency for each sample.
-        
+
         return: (batch_size, horizon, action_dim)
         '''
         device = state_traj.device
@@ -239,11 +284,11 @@ class RDTRunner(nn.Module,
             bias="none",
             target_modules=target_modules,
         )
-        
+
         self.model = get_peft_model(self.model, lora_config)
         print("LoRA has been applied to the RDT model.")
         self.model.print_trainable_parameters()
-    
+
     # ========= Inference  ============
     def predict_action(self, lang_tokens, lang_attn_mask, img_tokens, state_tokens, action_mask, ctrl_freqs):
         '''
@@ -255,7 +300,7 @@ class RDTRunner(nn.Module,
         action_mask: (batch_size, 1, action_dim),
             which should be a 0-1 **float** tensor.
         ctrl_freqs: (batch_size,), control frequency for each sample.
-        
+
         return: (batch_size, horizon, action_dim), predicted action sequence
         '''
         # Prepare the state and conditions
@@ -279,7 +324,8 @@ class RDTRunner(nn.Module,
         return self.compute_loss(*args, **kwargs)
 
     def compute_loss(self, lang_tokens, lang_attn_mask, img_tokens, state_tokens, action_gt, action_mask,
-                    ctrl_freqs, encoder_depth, future_images) -> torch.Tensor:
+                    ctrl_freqs, encoder_depth, future_images=None, future_tcp_2p5d_bins=None,
+                    future_tcp_2p5d_bins_mask=None, tcp_maps=None) -> torch.Tensor:
         '''
         lang_tokens: (batch_size, lang_len, lang_token_dim)
         lang_attn_mask: (batch_size, lang_len), a mask for valid language tokens,
@@ -289,7 +335,7 @@ class RDTRunner(nn.Module,
         action_gt: (batch_size, horizon, state_token_dim), ground-truth actions for supervision
         action_mask: (batch_size, 1, state_token_dim), a 0-1 **float** tensor.
         ctrl_freqs: (batch_size,), control frequency for each sample.
-        
+
         return: loss_value, a scalar tensor
         '''
         batch_size = lang_tokens.shape[0]
@@ -309,24 +355,29 @@ class RDTRunner(nn.Module,
         state_action_traj = torch.cat([state_tokens, noisy_action], dim=1)
         action_mask = action_mask.expand(-1, state_action_traj.shape[1], -1)
         state_action_traj = torch.cat([state_action_traj, action_mask], dim=2)
+        if img_tokens is None and tcp_maps is not None:
+            img_tokens = self.encode_tcp_maps(tcp_maps)
         lang_cond, img_cond, state_action_traj = self.adapt_conditions(lang_tokens, img_tokens, state_action_traj)
-        
+
         zs = []
-        with self.accelerator.autocast():
-            for encoder, encoder_type, arch in zip(self.encoders, self.encoder_types, self.architectures):   
-                raw_image_ = preprocess_raw_image(future_images, encoder_type)
-                if 'theia' in encoder_type:
-                    raw_image = raw_image_.permute(0, 2, 3, 1)
-                    input_for_theia = raw_image.to(torch.uint8)
-                    z = encoder.forward_features(input_for_theia.to(torch.float32), feature_reduction_method='none')
-                else:
-                    z = encoder.forward_features(raw_image_)
-                    
-                if 'dinov2' in encoder_type: z = z['x_norm_patchtokens']
+        if self.wm_target_type == "future_image":
+            with self.accelerator.autocast():
+                for encoder, encoder_type, arch in zip(self.encoders, self.encoder_types, self.architectures):
+                    raw_image_ = preprocess_raw_image(future_images, encoder_type)
+                    if 'theia' in encoder_type:
+                        raw_image = raw_image_.permute(0, 2, 3, 1)
+                        input_for_theia = raw_image.to(torch.uint8)
+                        z = encoder.forward_features(input_for_theia.to(torch.float32), feature_reduction_method='none')
+                    else:
+                        z = encoder.forward_features(raw_image_)
 
-                zs.append(z)
+                    if 'dinov2' in encoder_type: z = z['x_norm_patchtokens']
 
-        pred, zs_future = self.model(state_action_traj, ctrl_freqs, timesteps, lang_cond, img_cond, lang_mask=lang_attn_mask, encoder_depth=encoder_depth)
+                    zs.append(z)
+
+        pred, future_aux = self.model(state_action_traj, ctrl_freqs, timesteps, lang_cond, img_cond,
+                                      lang_mask=lang_attn_mask, encoder_depth=encoder_depth,
+                                      wm_target_type=self.wm_target_type)
 
         pred_type = self.prediction_type
         if pred_type == 'epsilon':
@@ -345,13 +396,31 @@ class RDTRunner(nn.Module,
             loss = masked_losses.sum() / num_real_actions
         else:
             loss = torch.tensor(0.0, device=device)
+        if self.wm_target_type in {"tcp_2p5d_10bin", "tcp_2p5d_aggregate"}:
+            if future_aux is None:
+                raise RuntimeError("Future TCP map head did not return predictions.")
+            bins = self.future_bins if self.wm_target_type == "tcp_2p5d_10bin" else 1
+            heatmap_gt = future_tcp_2p5d_bins[:, :bins]
+            depth_gt = future_tcp_2p5d_bins[:, bins:bins * 2]
+            mask = future_tcp_2p5d_bins_mask[:, :bins]
+            heatmap_logits = future_aux[:, :bins]
+            depth_pred = torch.sigmoid(future_aux[:, bins:bins * 2])
+            heatmap_loss = F.binary_cross_entropy_with_logits(heatmap_logits, heatmap_gt)
+            depth_loss = F.smooth_l1_loss(depth_pred * mask, depth_gt * mask, reduction='sum') / mask.sum().clamp_min(1.0)
+            proj_loss = self.heatmap_loss_weight * heatmap_loss + self.depth_loss_weight * depth_loss
+            aux_logs = {
+                "hm_loss": heatmap_loss.detach(),
+                "depth_loss": depth_loss.detach(),
+            }
+            return loss, proj_loss, aux_logs
+
         proj_loss = 0.
         bsz = zs[0].shape[0]
-        for i, (z, z_tilde) in enumerate(zip(zs, zs_future)):
+        for i, (z, z_tilde) in enumerate(zip(zs, future_aux)):
             for j, (z_j, z_tilde_j) in enumerate(zip(z, z_tilde)):
-                z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1) 
-                z_j = torch.nn.functional.normalize(z_j, dim=-1) 
+                z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1)
+                z_j = torch.nn.functional.normalize(z_j, dim=-1)
                 proj_loss += mean_flat(1-(z_j * z_tilde_j).sum(dim=-1))
         proj_loss /= (len(zs) * bsz)
 
-        return loss, proj_loss
+        return loss, proj_loss, {}

@@ -4,7 +4,10 @@ import json
 
 import h5py
 import yaml
-import cv2
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 import numpy as np
 
 from configs.state_vec import STATE_VEC_IDX_MAPPING
@@ -51,6 +54,16 @@ class HDF5VLADataset:
         self.IMG_HISORY_SIZE = config["common"]["img_history_size"]
         self.STATE_DIM = config["common"]["state_dim"]
         self.wm_horizon = wm_horizon
+        self.wm_input_type = model_config.get("wm_input_type", "future_image")
+        self.wm_target_type = model_config.get("wm_target_type", "future_image")
+        self.wm_target_camera = model_config.get("wm_target_camera", "cam_high")
+        self.tcp_history_size = int(model_config.get("tcp_history_size", 2))
+        self.future_bins = int(model_config.get("future_bins", 10))
+        self.future_bin_size = int(model_config.get("future_bin_size", 3))
+        self.tcp_map_size = int(model_config.get("wm_target_size", 224))
+        self.tcp_source_width = float(model_config.get("tcp_source_width", 640))
+        self.tcp_source_height = float(model_config.get("tcp_source_height", 480))
+        self.tcp_heatmap_sigma = float(model_config.get("tcp_heatmap_sigma", 0.8))
         # Get each episode's len
         episode_lens = []
         for file_path in self.file_paths:
@@ -89,6 +102,94 @@ class HDF5VLADataset:
                 return sample
             else:
                 index = np.random.randint(0, len(self.file_paths))
+
+    def _render_tcp_2p5d(self, uvs, depths, valids):
+        size = self.tcp_map_size
+        heatmap = np.zeros((size, size), dtype=np.float32)
+        depth_acc = np.zeros((size, size), dtype=np.float32)
+        weight_acc = np.zeros((size, size), dtype=np.float32)
+        sigma = self.tcp_heatmap_sigma
+        radius = max(1, int(np.ceil(3 * sigma)))
+
+        for uv, depth, valid in zip(uvs, depths, valids):
+            if not valid or not np.isfinite(depth):
+                continue
+            if uv.shape[0] < 2 or not np.all(np.isfinite(uv[:2])):
+                continue
+            cx = float(uv[0]) * size / self.tcp_source_width
+            cy = float(uv[1]) * size / self.tcp_source_height
+            if cx < 0 or cy < 0 or cx >= size or cy >= size:
+                continue
+
+            x0 = max(0, int(np.floor(cx)) - radius)
+            x1 = min(size, int(np.floor(cx)) + radius + 1)
+            y0 = max(0, int(np.floor(cy)) - radius)
+            y1 = min(size, int(np.floor(cy)) + radius + 1)
+            xs = np.arange(x0, x1, dtype=np.float32)
+            ys = np.arange(y0, y1, dtype=np.float32)
+            yy, xx = np.meshgrid(ys, xs, indexing="ij")
+            gaussian = np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2)).astype(np.float32)
+            depth_value = np.clip(float(depth), 0.0, 1.0)
+
+            heatmap[y0:y1, x0:x1] = np.maximum(heatmap[y0:y1, x0:x1], gaussian)
+            depth_acc[y0:y1, x0:x1] += gaussian * depth_value
+            weight_acc[y0:y1, x0:x1] += gaussian
+
+        mask = (weight_acc > 1e-6).astype(np.float32)
+        depth_map = np.zeros_like(depth_acc)
+        depth_map[mask > 0] = depth_acc[mask > 0] / weight_acc[mask > 0]
+        return heatmap, depth_map, mask
+
+    def _render_current_tcp_2p5d(self, view, step_id):
+        uvs = np.stack([
+            view["current_tcp_2d"]["left"][step_id],
+            view["current_tcp_2d"]["right"][step_id],
+        ], axis=0)
+        depths = np.array([
+            view["current_tcp_depth"]["left"][step_id],
+            view["current_tcp_depth"]["right"][step_id],
+        ], dtype=np.float32)
+        valids = np.array([
+            view["current_tcp_valid"]["left"][step_id],
+            view["current_tcp_valid"]["right"][step_id],
+        ], dtype=bool)
+        return self._render_tcp_2p5d(uvs, depths, valids)
+
+    def _build_past_tcp_2p5d(self, f, step_id):
+        view = f["observations"]["views"][self.wm_target_camera]
+        channels = []
+        masks = []
+        for hist_i in range(self.tcp_history_size - 1, -1, -1):
+            hist_step = max(0, step_id - hist_i)
+            heatmap, depth_map, mask = self._render_current_tcp_2p5d(view, hist_step)
+            channels.extend([heatmap, depth_map])
+            masks.append(mask)
+        return np.stack(channels, axis=0).astype(np.float32), np.stack(masks, axis=0).astype(np.float32)
+
+    def _build_future_tcp_2p5d_bins(self, f, step_id):
+        view = f["observations"]["views"][self.wm_target_camera]
+        left_uv = view["future_tcp_2d"]["left"][step_id]
+        right_uv = view["future_tcp_2d"]["right"][step_id]
+        left_depth = view["future_tcp_depth"]["left"][step_id]
+        right_depth = view["future_tcp_depth"]["right"][step_id]
+        left_valid = view["future_tcp_valid"]["left"][step_id]
+        right_valid = view["future_tcp_valid"]["right"][step_id]
+
+        heatmaps = []
+        depths = []
+        masks = []
+        for bin_idx in range(self.future_bins):
+            start = bin_idx * self.future_bin_size
+            end = min(start + self.future_bin_size, left_uv.shape[0])
+            uvs = np.concatenate([left_uv[start:end], right_uv[start:end]], axis=0)
+            depth_values = np.concatenate([left_depth[start:end], right_depth[start:end]], axis=0)
+            valid_values = np.concatenate([left_valid[start:end], right_valid[start:end]], axis=0).astype(bool)
+            heatmap, depth_map, mask = self._render_tcp_2p5d(uvs, depth_values, valid_values)
+            heatmaps.append(heatmap)
+            depths.append(depth_map)
+            masks.append(mask)
+        future = np.concatenate([np.stack(heatmaps, axis=0), np.stack(depths, axis=0)], axis=0)
+        return future.astype(np.float32), np.stack(masks, axis=0).astype(np.float32)
 
     def parse_hdf5_file(self, file_path, wm_horizon):
         """[Modify] Parse a hdf5 file to generate a training sample at
@@ -165,12 +266,33 @@ class HDF5VLADataset:
             # Load the instruction
             dir_path = os.path.dirname(file_path)
             instructions_path = os.path.join(dir_path, "instructions")
+            if not os.path.isdir(instructions_path) and "source_dataset_root" in f.attrs:
+                instructions_path = os.path.join(str(f.attrs["source_dataset_root"]), "instructions")
             instructions_names = []
-
-            for filename in os.listdir(instructions_path):
-                if filename.endswith(".pt"):
-                    instructions_names.append(os.path.join(instructions_path, filename))
-            instruction = np.random.choice(instructions_names)
+            instruction_texts = []
+            if os.path.isdir(instructions_path):
+                for filename in os.listdir(instructions_path):
+                    file_path_for_instruction = os.path.join(instructions_path, filename)
+                    if filename.endswith(".pt"):
+                        instructions_names.append(file_path_for_instruction)
+                    elif filename.endswith(".json"):
+                        try:
+                            with open(file_path_for_instruction, "r") as fp:
+                                payload = json.load(fp)
+                            if isinstance(payload, dict):
+                                for split in ["seen", "unseen"]:
+                                    values = payload.get(split, [])
+                                    if isinstance(values, list):
+                                        instruction_texts.extend([v for v in values if isinstance(v, str)])
+                        except Exception:
+                            pass
+            if instructions_names:
+                instruction = str(np.random.choice(instructions_names))
+            elif instruction_texts:
+                instruction = str(np.random.choice(instruction_texts))
+            else:
+                task_name = os.path.basename(os.path.dirname(dir_path)).split("-", 1)[0]
+                instruction = task_name.replace("_", " ")
             # Assemble the meta
             meta = {
                 "dataset_name": self.DATASET_NAME,
@@ -222,62 +344,7 @@ class HDF5VLADataset:
             # you may implement fill_in_action()
             actions = fill_in_state(actions)
 
-            # Parse the images
-            def parse_img(key):
-                imgs = []
-                for i in range(max(step_id - self.IMG_HISORY_SIZE + 1, 0), step_id + 1):
-                    img_bits = f["observations"]["images"][key][i]
-                    img = cv2.imdecode(np.frombuffer(img_bits, np.uint8), cv2.IMREAD_COLOR)
-                    imgs.append(img)
-                imgs = np.stack(imgs)
-                if imgs.shape[0] < self.IMG_HISORY_SIZE:
-                    # Pad the images using the first image
-                    imgs = np.concatenate(
-                        [
-                            np.tile(
-                                imgs[:1],
-                                (self.IMG_HISORY_SIZE - imgs.shape[0], 1, 1, 1),
-                            ),
-                            imgs,
-                        ],
-                        axis=0,
-                    )
-                return imgs
-            
-            # Parse the images
-            def parse_future_img(key, wm_horizon):
-                future_imgs = []
-                if step_id+wm_horizon < f["observations"]["images"][key].shape[0]:
-                    future_img_bits = f["observations"]["images"][key][step_id+wm_horizon]
-                    future_img = cv2.imdecode(np.frombuffer(future_img_bits, np.uint8), cv2.IMREAD_COLOR)
-                else:
-                    future_img_bits = f["observations"]["images"][key][-1]
-                    future_img = cv2.imdecode(np.frombuffer(future_img_bits, np.uint8), cv2.IMREAD_COLOR)
-                if step_id+wm_horizon/2 < f["observations"]["images"][key].shape[0]:
-                    short_future_img_bits = f["observations"]["images"][key][int(step_id+wm_horizon/2)]
-                    short_future_img = cv2.imdecode(np.frombuffer(short_future_img_bits, np.uint8), cv2.IMREAD_COLOR)
-                else:
-                    short_future_img_bits = f["observations"]["images"][key][-1]
-                    short_future_img = cv2.imdecode(np.frombuffer(short_future_img_bits, np.uint8), cv2.IMREAD_COLOR)
-                future_images = np.stack([future_img, short_future_img], axis=0)
-                return future_images
-            
-            # `cam_high` is the external camera image
-            cam_high = parse_img("cam_high")
-            valid_len = min(step_id - (first_idx - 1) + 1, self.IMG_HISORY_SIZE)
-            cam_high_mask = np.array([False] * (self.IMG_HISORY_SIZE - valid_len) + [True] * valid_len)
-            cam_left_wrist = parse_img("cam_left_wrist")
-            cam_left_wrist_mask = cam_high_mask.copy()
-            cam_right_wrist = parse_img("cam_right_wrist")
-            cam_right_wrist_mask = cam_high_mask.copy()
-            future_cam_high = parse_future_img("cam_high", wm_horizon)
-            future_cam_high_mask = cam_high_mask.copy() 
-            future_cam_left_wrist = parse_future_img("cam_left_wrist", wm_horizon)
-            future_cam_left_wrist_mask = cam_left_wrist_mask.copy()
-            future_cam_right_wrist = parse_future_img("cam_right_wrist", wm_horizon)
-            future_cam_right_wrist_mask = cam_right_wrist_mask.copy()
-
-            return True, {
+            sample = {
                 "meta": meta,
                 "state": state,
                 "state_std": state_std,
@@ -285,19 +352,81 @@ class HDF5VLADataset:
                 "state_norm": state_norm,
                 "actions": actions,
                 "state_indicator": state_indicator,
-                "cam_high": cam_high,
-                "cam_high_mask": cam_high_mask,
-                "cam_left_wrist": cam_left_wrist,
-                "cam_left_wrist_mask": cam_left_wrist_mask,
-                "cam_right_wrist": cam_right_wrist,
-                "cam_right_wrist_mask": cam_right_wrist_mask,
-                "future_cam_high": future_cam_high,
-                "future_cam_high_mask": future_cam_high_mask,
-                "future_cam_left_wrist": future_cam_left_wrist,
-                "future_cam_left_wrist_mask": future_cam_left_wrist_mask,
-                "future_cam_right_wrist": future_cam_right_wrist,
-                "future_cam_right_wrist_mask": future_cam_right_wrist_mask,
             }
+
+            if self.wm_input_type == "tcp_2p5d":
+                past_tcp_2p5d, past_tcp_2p5d_mask = self._build_past_tcp_2p5d(f, step_id)
+                sample["past_tcp_2p5d"] = past_tcp_2p5d
+                sample["past_tcp_2p5d_mask"] = past_tcp_2p5d_mask
+
+            if self.wm_target_type == "tcp_2p5d_10bin":
+                future_tcp_2p5d_bins, future_tcp_2p5d_bins_mask = self._build_future_tcp_2p5d_bins(f, step_id)
+                sample["future_tcp_2p5d_bins"] = future_tcp_2p5d_bins
+                sample["future_tcp_2p5d_bins_mask"] = future_tcp_2p5d_bins_mask
+            elif self.wm_target_type == "tcp_2p5d_aggregate":
+                traj_2p5d = f["observations"]["traj_2p5d"][self.wm_target_camera][step_id]
+                traj_mask = f["observations"]["traj_2p5d_mask"][self.wm_target_camera][step_id]
+                sample["future_tcp_2p5d_bins"] = np.transpose(traj_2p5d, (2, 0, 1)).astype(np.float32)
+                sample["future_tcp_2p5d_bins_mask"] = np.transpose(traj_mask, (2, 0, 1)).astype(np.float32)
+
+            if self.wm_input_type == "rgb" or self.wm_target_type == "future_image":
+                if cv2 is None:
+                    raise ImportError("opencv-python is required for RGB image input or future_image targets")
+                # Parse the images
+                def parse_img(key):
+                    imgs = []
+                    for i in range(max(step_id - self.IMG_HISORY_SIZE + 1, 0), step_id + 1):
+                        img_bits = f["observations"]["images"][key][i]
+                        img = cv2.imdecode(np.frombuffer(img_bits, np.uint8), cv2.IMREAD_COLOR)
+                        imgs.append(img)
+                    imgs = np.stack(imgs)
+                    if imgs.shape[0] < self.IMG_HISORY_SIZE:
+                        imgs = np.concatenate(
+                            [
+                                np.tile(
+                                    imgs[:1],
+                                    (self.IMG_HISORY_SIZE - imgs.shape[0], 1, 1, 1),
+                                ),
+                                imgs,
+                            ],
+                            axis=0,
+                        )
+                    return imgs
+
+                def parse_future_img(key, wm_horizon):
+                    if step_id + wm_horizon < f["observations"]["images"][key].shape[0]:
+                        future_img_bits = f["observations"]["images"][key][step_id + wm_horizon]
+                    else:
+                        future_img_bits = f["observations"]["images"][key][-1]
+                    future_img = cv2.imdecode(np.frombuffer(future_img_bits, np.uint8), cv2.IMREAD_COLOR)
+                    if step_id + wm_horizon / 2 < f["observations"]["images"][key].shape[0]:
+                        short_future_img_bits = f["observations"]["images"][key][int(step_id + wm_horizon / 2)]
+                    else:
+                        short_future_img_bits = f["observations"]["images"][key][-1]
+                    short_future_img = cv2.imdecode(np.frombuffer(short_future_img_bits, np.uint8), cv2.IMREAD_COLOR)
+                    return np.stack([future_img, short_future_img], axis=0)
+
+                cam_high = parse_img("cam_high")
+                valid_len = min(step_id - (first_idx - 1) + 1, self.IMG_HISORY_SIZE)
+                cam_high_mask = np.array([False] * (self.IMG_HISORY_SIZE - valid_len) + [True] * valid_len)
+                cam_left_wrist = parse_img("cam_left_wrist")
+                cam_right_wrist = parse_img("cam_right_wrist")
+                sample.update({
+                    "cam_high": cam_high,
+                    "cam_high_mask": cam_high_mask,
+                    "cam_left_wrist": cam_left_wrist,
+                    "cam_left_wrist_mask": cam_high_mask.copy(),
+                    "cam_right_wrist": cam_right_wrist,
+                    "cam_right_wrist_mask": cam_high_mask.copy(),
+                    "future_cam_high": parse_future_img("cam_high", wm_horizon),
+                    "future_cam_high_mask": cam_high_mask.copy(),
+                    "future_cam_left_wrist": parse_future_img("cam_left_wrist", wm_horizon),
+                    "future_cam_left_wrist_mask": cam_high_mask.copy(),
+                    "future_cam_right_wrist": parse_future_img("cam_right_wrist", wm_horizon),
+                    "future_cam_right_wrist_mask": cam_high_mask.copy(),
+                })
+
+            return True, sample
 
     def parse_hdf5_file_state_only(self, file_path):
         """[Modify] Parse a hdf5 file to generate a state trajectory.

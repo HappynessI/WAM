@@ -12,7 +12,7 @@ sys.path.append(current_file.parent.parent)
 from rdt.blocks import (FinalLayer, RDTBlock, TimestepEmbedder, get_1d_sincos_pos_embed_from_grid,
                         get_multimodal_cond_pos_embed)
 
-def build_mlp(hidden_size, projector_dim, z_dim): 
+def build_mlp(hidden_size, projector_dim, z_dim):
     return nn.Sequential(
                 nn.Linear(hidden_size, projector_dim),
                 nn.SiLU(),
@@ -28,7 +28,7 @@ class RDT(nn.Module):
 
     def __init__(self,
                  output_dim=128,
-                 horizon=None, 
+                 horizon=None,
                  hidden_size=1152,
                  depth=28,
                  num_heads=16,
@@ -68,6 +68,14 @@ class RDT(nn.Module):
         self.projectors = nn.ModuleList([
             build_mlp(hidden_size, projector_dim, z_dim) for z_dim in z_dims
             ])
+        self.future_map_head = nn.Sequential(
+            nn.Conv2d(hidden_size, 512, kernel_size=1),
+            nn.SiLU(),
+            nn.Upsample(size=(224, 224), mode="bilinear", align_corners=False),
+            nn.Conv2d(512, 128, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(128, 20, kernel_size=1),
+        )
         self.final_layer = FinalLayer(hidden_size, output_dim)
         self.initialize_weights()
 
@@ -122,12 +130,13 @@ class RDT(nn.Module):
         # Move all the params to given data type:
         self.to(self.dtype)
 
-    def forward(self, x, freq, t, lang_c, img_c, 
-                learnable_tokens=None, 
+    def forward(self, x, freq, t, lang_c, img_c,
+                learnable_tokens=None,
                 x_pos_embed=None,
                 projectors=None,
-                lang_mask=None, img_mask=None, encoder_depth=None, return_hidden_states=False, eval=False):
-        
+                lang_mask=None, img_mask=None, encoder_depth=None, return_hidden_states=False, eval=False,
+                wm_target_type=None):
+
         local_learnable_tokens = self.learnable_tokens if learnable_tokens is None else learnable_tokens
         local_x_pos_embed = self.x_pos_embed if x_pos_embed is None else x_pos_embed
         local_projectors = self.projectors if projectors is None else projectors
@@ -145,9 +154,10 @@ class RDT(nn.Module):
 
         x = x + local_x_pos_embed
         lang_c = lang_c + self.lang_cond_pos_embed[:, :lang_c.shape[1]]
-        img_c = img_c + self.img_cond_pos_embed
+        img_c = img_c + self.img_cond_pos_embed[:, :img_c.shape[1]]
 
-        zs_future = None 
+        zs_future = None
+        future_map = None
         conds = [lang_c, img_c]
         masks = [lang_mask, img_mask]
         for i, block in enumerate(self.blocks):
@@ -156,17 +166,33 @@ class RDT(nn.Module):
             if encoder_depth is not None and (i + 1) == encoder_depth and num_learnable > 0:
                 x_future = x[:, -num_learnable:, :]
                 zs_future = [projector(x_future.reshape(-1, x_future.shape[-1])).reshape(x_future.shape[0], num_learnable, -1) for projector in local_projectors]
-        
+                grid_size = int(num_learnable ** 0.5)
+                if grid_size * grid_size == num_learnable:
+                    future_map = self.future_map_head(
+                        x_future.reshape(x_future.shape[0], grid_size, grid_size, x_future.shape[-1]).permute(0, 3, 1, 2)
+                    )
+        if future_map is None and num_learnable > 0 and wm_target_type in {"tcp_2p5d_10bin", "tcp_2p5d_aggregate"}:
+            x_future = x[:, -num_learnable:, :]
+            grid_size = int(num_learnable ** 0.5)
+            if grid_size * grid_size == num_learnable:
+                future_map = self.future_map_head(
+                    x_future.reshape(x_future.shape[0], grid_size, grid_size, x_future.shape[-1]).permute(0, 3, 1, 2)
+                )
+
         hidden_states = x[:, -(self.horizon + num_learnable):-num_learnable]
         if return_hidden_states:
             return (hidden_states, zs_future) if zs_future is not None else hidden_states
-        
+
         x = self.final_layer(x)
 
         if num_learnable > 0:
             x = x[:, -(self.horizon + num_learnable):-num_learnable]
-        else: 
+        else:
             x = x[:, -self.horizon:]
         if eval:
             return x, hidden_states
+        if wm_target_type == "tcp_2p5d_10bin":
+            return x, future_map
+        if wm_target_type == "tcp_2p5d_aggregate":
+            return x, future_map[:, :2] if future_map is not None else None
         return x, zs_future

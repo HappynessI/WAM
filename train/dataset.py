@@ -15,7 +15,10 @@ import transformers
 
 from data.filelock import FileLock
 from data.hdf5_vla_dataset import HDF5VLADataset
-from train.image_corrupt import image_corrupt
+try:
+    from train.image_corrupt import image_corrupt
+except ImportError:
+    image_corrupt = None
 
 
 def get_clean_item(chunk_dir):
@@ -116,7 +119,7 @@ class VLAConsumerDataset(Dataset):
         self.model_config_path = model_config_path
         self.buffer_dir = config["buf_path"]
         self.num_chunks = config["buf_num_chunks"]
-        self.chunk_size = config["buf_chunk_size"] 
+        self.chunk_size = config["buf_chunk_size"]
         self.tokenizer_max_length = config["tokenizer_max_length"]
         self.image_aspect_ratio = config["image_aspect_ratio"]
         self.state_noise_snr = state_noise_snr
@@ -248,20 +251,22 @@ class VLAConsumerDataset(Dataset):
                     states = res["state"]
                     actions = res["actions"]
                     state_elem_mask = res["state_indicator"]
-                    image_metas = [
-                        res["cam_high"],
-                        res["cam_high_mask"],
-                        res["cam_right_wrist"],
-                        res["cam_right_wrist_mask"],
-                        res["cam_left_wrist"],
-                        res["cam_left_wrist_mask"],
-                        res["future_cam_high"],
-                        res["future_cam_high_mask"],
-                        res["future_cam_left_wrist"],
-                        res["future_cam_left_wrist_mask"],
-                        res["future_cam_right_wrist"],
-                        res["future_cam_right_wrist_mask"],
-                    ]
+                    image_metas = []
+                    if "cam_high" in res:
+                        image_metas = [
+                            res["cam_high"],
+                            res["cam_high_mask"],
+                            res["cam_right_wrist"],
+                            res["cam_right_wrist_mask"],
+                            res["cam_left_wrist"],
+                            res["cam_left_wrist_mask"],
+                            res["future_cam_high"],
+                            res["future_cam_high_mask"],
+                            res["future_cam_left_wrist"],
+                            res["future_cam_left_wrist_mask"],
+                            res["future_cam_right_wrist"],
+                            res["future_cam_right_wrist_mask"],
+                        ]
                     state_std = res["state_std"]
                     state_mean = res["state_mean"]
                     state_norm = res["state_norm"]
@@ -279,7 +284,7 @@ class VLAConsumerDataset(Dataset):
                         state_std,
                         state_mean,
                         state_norm,
-                    ) = self._safe_load(index) 
+                    ) = self._safe_load(index)
 
                 data_dict = {}
                 data_dict["dataset_name"] = content["dataset_name"]
@@ -304,75 +309,85 @@ class VLAConsumerDataset(Dataset):
                 # Stat for the episode that the step belongs to
                 data_dict["state_norm"] = state_norm
 
-                # We replace the invalid images with the background image
-                # and also randomly mask images by the background image
-                background_color = np.array(
-                    [int(x * 255) for x in self.image_processor.image_mean],
-                    dtype=np.uint8,
-                ).reshape(1, 1, 3)
-                background_image = (np.ones(
-                    (
-                        self.image_processor.size["height"],
-                        self.image_processor.size["width"],
-                        3,
-                    ),
-                    dtype=np.uint8,
-                ) * background_color)
+                if "past_tcp_2p5d" in res:
+                    data_dict["past_tcp_2p5d"] = res["past_tcp_2p5d"]
+                    data_dict["past_tcp_2p5d_mask"] = res["past_tcp_2p5d_mask"]
+                if "future_tcp_2p5d_bins" in res:
+                    data_dict["future_tcp_2p5d_bins"] = res["future_tcp_2p5d_bins"]
+                    data_dict["future_tcp_2p5d_bins_mask"] = res["future_tcp_2p5d_bins_mask"]
 
-                image_metas = list(self.pairwise(image_metas))                
-                mask_probs = [self.cond_mask_prob] * self.num_cameras * 2 
-                if self.cam_ext_mask_prob >= 0.0:
-                    mask_probs[0] = self.cam_ext_mask_prob
-                rearranged_images = []
-                for i in range(self.img_history_size):
-                    for j in range(self.num_cameras * 2):
-                        images, image_mask = image_metas[j]
-                        image, valid = images[i], image_mask[i]
-                        if (valid and (math.prod(image.shape) > 0) and (random.random() > mask_probs[j])):
-                            rearranged_images.append((image, True))
-                        else:
-                            rearranged_images.append((background_image.copy(), False))
+                if image_metas:
+                    # We replace the invalid images with the background image
+                    # and also randomly mask images by the background image
+                    background_color = np.array(
+                        [int(x * 255) for x in self.image_processor.image_mean],
+                        dtype=np.uint8,
+                    ).reshape(1, 1, 3)
+                    background_image = (np.ones(
+                        (
+                            self.image_processor.size["height"],
+                            self.image_processor.size["width"],
+                            3,
+                        ),
+                        dtype=np.uint8,
+                    ) * background_color)
 
-                preprocessed_images = []
-                processor = self.image_processor
-                for image, valid in rearranged_images:
-                    image = Image.fromarray(image)
-                    if self.image_size is not None:
-                        image = transforms.Resize(self.image_size)(image)  
-
-                    if valid and self.auto_adjust_image_brightness:
-                        pixel_values = list(image.getdata())
-                        average_brightness = sum(sum(pixel) for pixel in pixel_values) / (len(pixel_values) * 255.0 * 3)
-                        if average_brightness <= 0.15:
-                            image = transforms.ColorJitter(brightness=(1.75, 1.75))(image)
-
-                    # Only apply image augmentation to 50% of the images
-                    if valid and self.image_aug and (random.random() > 0.5):
-                        aug_type = random.choice(["corrput_only", "color_only", "both"])
-                        if aug_type != "corrput_only":
-                            image = transforms.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5,
-                                                           hue=0.03)(image)
-                        if aug_type != "color_only":
-                            image = image_corrupt(image)
-
-                    if self.image_aspect_ratio == "pad":
-
-                        def expand2square(pil_img, background_color):
-                            width, height = pil_img.size
-                            if width == height:
-                                return pil_img
-                            elif width > height:
-                                result = Image.new(pil_img.mode, (width, width), background_color)
-                                result.paste(pil_img, (0, (width - height) // 2))
-                                return result
+                    image_metas = list(self.pairwise(image_metas))
+                    mask_probs = [self.cond_mask_prob] * self.num_cameras * 2
+                    if self.cam_ext_mask_prob >= 0.0:
+                        mask_probs[0] = self.cam_ext_mask_prob
+                    rearranged_images = []
+                    for i in range(self.img_history_size):
+                        for j in range(self.num_cameras * 2):
+                            images, image_mask = image_metas[j]
+                            image, valid = images[i], image_mask[i]
+                            if (valid and (math.prod(image.shape) > 0) and (random.random() > mask_probs[j])):
+                                rearranged_images.append((image, True))
                             else:
-                                result = Image.new(pil_img.mode, (height, height), background_color)
-                                result.paste(pil_img, ((height - width) // 2, 0))
-                                return result
-                        image = expand2square(image, tuple(int(x * 255) for x in processor.image_mean))
-                    image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
-                    preprocessed_images.append(image)
-                data_dict["images"] = preprocessed_images
+                                rearranged_images.append((background_image.copy(), False))
+
+                    preprocessed_images = []
+                    processor = self.image_processor
+                    for image, valid in rearranged_images:
+                        image = Image.fromarray(image)
+                        if self.image_size is not None:
+                            image = transforms.Resize(self.image_size)(image)
+
+                        if valid and self.auto_adjust_image_brightness:
+                            pixel_values = list(image.getdata())
+                            average_brightness = sum(sum(pixel) for pixel in pixel_values) / (len(pixel_values) * 255.0 * 3)
+                            if average_brightness <= 0.15:
+                                image = transforms.ColorJitter(brightness=(1.75, 1.75))(image)
+
+                        # Only apply image augmentation to 50% of the images
+                        if valid and self.image_aug and image_corrupt is None:
+                            raise ImportError("imgaug is required when image_aug is enabled")
+                        if valid and self.image_aug and (random.random() > 0.5):
+                            aug_type = random.choice(["corrput_only", "color_only", "both"])
+                            if aug_type != "corrput_only":
+                                image = transforms.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5,
+                                                               hue=0.03)(image)
+                            if aug_type != "color_only":
+                                image = image_corrupt(image)
+
+                        if self.image_aspect_ratio == "pad":
+
+                            def expand2square(pil_img, background_color):
+                                width, height = pil_img.size
+                                if width == height:
+                                    return pil_img
+                                elif width > height:
+                                    result = Image.new(pil_img.mode, (width, width), background_color)
+                                    result.paste(pil_img, (0, (width - height) // 2))
+                                    return result
+                                else:
+                                    result = Image.new(pil_img.mode, (height, height), background_color)
+                                    result.paste(pil_img, ((height - width) // 2, 0))
+                                    return result
+                            image = expand2square(image, tuple(int(x * 255) for x in processor.image_mean))
+                        image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+                        preprocessed_images.append(image)
+                    data_dict["images"] = preprocessed_images
 
                 if self.use_precomp_lang_embed:
                     if content["instruction"][-1] == ".":
@@ -428,6 +443,10 @@ class DataCollatorForVLAConsumerDataset(object):
             "state_elem_mask": [],
             "state_norm": [],
             "images": [],
+            "past_tcp_2p5d": [],
+            "past_tcp_2p5d_mask": [],
+            "future_tcp_2p5d_bins": [],
+            "future_tcp_2p5d_bins_mask": [],
             "data_indices": [],
             "ctrl_freqs": [],
         }
@@ -456,13 +475,23 @@ class DataCollatorForVLAConsumerDataset(object):
                 lang_embeds.append(instance["lang_embed"])
                 lang_embed_lens.append(instance["lang_embed"].shape[0])
 
-            batch["images"].append(torch.stack(instance["images"], dim=0))
+            if "images" in instance:
+                batch["images"].append(torch.stack(instance["images"], dim=0))
+            for key in ["past_tcp_2p5d", "past_tcp_2p5d_mask", "future_tcp_2p5d_bins", "future_tcp_2p5d_bins_mask"]:
+                if key in instance:
+                    item = instance[key] if isinstance(instance[key], torch.Tensor) else torch.from_numpy(instance[key])
+                    batch[key].append(item)
             batch["data_indices"].append(instance["data_idx"])
             batch["ctrl_freqs"].append(instance["ctrl_freq"])
 
-        keys_to_stack = ["states", "actions", "state_elem_mask", "state_norm", "images"]
+        keys_to_stack = ["states", "actions", "state_elem_mask", "state_norm"]
         for key in keys_to_stack:
             batch[key] = torch.stack(batch[key], dim=0)
+        for key in ["images", "past_tcp_2p5d", "past_tcp_2p5d_mask", "future_tcp_2p5d_bins", "future_tcp_2p5d_bins_mask"]:
+            if len(batch[key]) > 0:
+                batch[key] = torch.stack(batch[key], dim=0)
+            else:
+                batch.pop(key)
 
         batch["ctrl_freqs"] = torch.tensor(batch["ctrl_freqs"])
 

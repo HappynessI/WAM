@@ -143,21 +143,50 @@ def train(args, logger):
         )
         tokenizer, text_encoder = text_embedder.tokenizer, text_embedder.model
 
-    vision_encoder = SiglipVisionTower(vision_tower=args.pretrained_vision_encoder_name_or_path, args=None)
+    use_rgb_input = args.wm_input_type == "rgb" or args.wm_target_type == "future_image"
+    vision_encoder = None
+    image_processor = None
+    if use_rgb_input:
+        vision_encoder = SiglipVisionTower(vision_tower=args.pretrained_vision_encoder_name_or_path, args=None)
+        image_processor = vision_encoder.image_processor
 
-    #vision_encoder = TheiaVisionTower(vision_tower=args.pretrained_vision_encoder_name_or_path, args=None)
-    image_processor = vision_encoder.image_processor
-    
     # Load from a pretrained checkpoint
     if args.pretrained_model_name_or_path is not None and not os.path.isfile(args.pretrained_model_name_or_path):
     # if args.pretrained_model_name_or_path is not None:
         logger.info("Constructing model from pretrained checkpoint.")
-        rdt = RDTRunner.from_pretrained(args.pretrained_model_name_or_path, enc_type=args.enc_type, resolution=args.resolution, accelerator=accelerator, learnable_tokens=args.learnable_tokens)
+        rdt = RDTRunner.from_pretrained(
+            args.pretrained_model_name_or_path,
+            enc_type=args.enc_type,
+            resolution=args.resolution,
+            accelerator=accelerator,
+            learnable_tokens=args.learnable_tokens,
+            wm_input_type=args.wm_input_type,
+            wm_target_type=args.wm_target_type,
+            tcp_history_size=args.tcp_history_size,
+            future_bins=args.future_bins,
+            heatmap_loss_weight=args.heatmap_loss_weight,
+            depth_loss_weight=args.depth_loss_weight,
+        )
     else:
         logger.info("Constructing model from provided config.")
             # Calculate the image condition length
-        img_cond_len = (config["common"]["img_history_size"] * config["common"]["num_cameras"] *
-                            vision_encoder.num_patches)
+        img_cond_len = (args.learnable_tokens if not use_rgb_input else
+                        config["common"]["img_history_size"] * config["common"]["num_cameras"] *
+                        vision_encoder.num_patches)
+        img_pos_embed_config = None
+        if use_rgb_input:
+            img_pos_embed_config = [
+                # No initial pos embed in the last grid size
+                # since we've already done in ViT
+                (
+                    "image",
+                    (
+                        config["common"]["img_history_size"],
+                        config["common"]["num_cameras"],
+                        -vision_encoder.num_patches,
+                    ),
+                ),
+            ]
         rdt = RDTRunner(
                 action_dim=config["common"]["state_dim"],
                 pred_horizon=config["common"]["action_chunk_size"],
@@ -167,18 +196,7 @@ def train(args, logger):
                 state_token_dim=config["model"]["state_token_dim"],
                 max_lang_cond_len=config["dataset"]["tokenizer_max_length"],
                 img_cond_len=img_cond_len,
-                img_pos_embed_config=[
-                    # No initial pos embed in the last grid size
-                    # since we've already done in ViT
-                    (
-                        "image",
-                        (
-                            config["common"]["img_history_size"],
-                            config["common"]["num_cameras"],
-                            -vision_encoder.num_patches,
-                        ),
-                    ),
-                ],
+                img_pos_embed_config=img_pos_embed_config,
                 lang_pos_embed_config=[
                     # Similarly, no initial pos embed for language
                     ("lang", -config["dataset"]["tokenizer_max_length"]),
@@ -188,6 +206,12 @@ def train(args, logger):
                 resolution=args.resolution,
                 accelerator=accelerator,
                 learnable_tokens=args.learnable_tokens,
+                wm_input_type=args.wm_input_type,
+                wm_target_type=args.wm_target_type,
+                tcp_history_size=args.tcp_history_size,
+                future_bins=args.future_bins,
+                heatmap_loss_weight=args.heatmap_loss_weight,
+                depth_loss_weight=args.depth_loss_weight,
         )
 
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
@@ -410,44 +434,61 @@ def train(args, logger):
         # Forward and backward
         for batch in train_dataloader:
             with accelerator.accumulate(rdt):
-                images = batch["images"].to(dtype=weight_dtype)
-                states = batch["states"].to(dtype=weight_dtype)  
+                states = batch["states"].to(dtype=weight_dtype)
                 states = states[:, -1:, :]
-                actions = batch["actions"].to(dtype=weight_dtype) 
+                actions = batch["actions"].to(dtype=weight_dtype)
                 state_elem_mask = batch["state_elem_mask"].to(dtype=weight_dtype)
                 ctrl_freqs = batch["ctrl_freqs"]
+                future_images = None
+                image_embeds = None
+                tcp_maps = None
+                future_tcp_2p5d_bins = None
+                future_tcp_2p5d_bins_mask = None
+
                 with torch.no_grad():
-                    batch_size, _, C, H, W = images.shape
-
-                    input_images = images[:, [0, 1, 2, 6, 7, 8]] 
-                    future_images = images[:, 3:4] 
-                    future_images = F.interpolate(
-                        future_images.squeeze(1), 
-                        size=(args.resolution, args.resolution),          
-                        mode='bicubic',
-                        align_corners=False       
-                    )
-                    image_embeds = vision_encoder(input_images.reshape(-1, C, H, W)).detach()
-                    image_embeds = image_embeds.reshape((batch_size, -1, vision_encoder.hidden_size))
-
                     lang_attn_mask = batch["lang_attn_mask"]
                     text_embeds = (batch["lang_embeds"].to(
                         dtype=weight_dtype) if args.precomp_lang_embed else text_encoder(
                             input_ids=batch["input_ids"], attention_mask=lang_attn_mask)["last_hidden_state"].detach())
 
+                    if use_rgb_input:
+                        images = batch["images"].to(dtype=weight_dtype)
+                        batch_size, _, C, H, W = images.shape
+                        input_images = images[:, [0, 1, 2, 6, 7, 8]]
+                        image_embeds = vision_encoder(input_images.reshape(-1, C, H, W)).detach()
+                        image_embeds = image_embeds.reshape((batch_size, -1, vision_encoder.hidden_size))
+                        if args.wm_target_type == "future_image":
+                            future_images = images[:, 3:4]
+                            future_images = F.interpolate(
+                                future_images.squeeze(1),
+                                size=(args.resolution, args.resolution),
+                                mode='bicubic',
+                                align_corners=False,
+                            )
+
+                if args.wm_input_type == "tcp_2p5d":
+                    tcp_maps = batch["past_tcp_2p5d"].to(dtype=weight_dtype)
+                if args.wm_target_type in {"tcp_2p5d_10bin", "tcp_2p5d_aggregate"}:
+                    future_tcp_2p5d_bins = batch["future_tcp_2p5d_bins"].to(dtype=weight_dtype)
+                    future_tcp_2p5d_bins_mask = batch["future_tcp_2p5d_bins_mask"].to(dtype=weight_dtype)
+
                 state_elem_mask = state_elem_mask.unsqueeze(1)
-                
-                loss, proj_loss = rdt(
+
+                loss_out = rdt(
                     lang_tokens=text_embeds,
                     lang_attn_mask=lang_attn_mask,
                     img_tokens=image_embeds,
                     state_tokens=states,
-                    action_gt=actions, 
+                    action_gt=actions,
                     action_mask=state_elem_mask,
                     ctrl_freqs=ctrl_freqs,
                     encoder_depth=args.encoder_depth,
                     future_images=future_images,
+                    future_tcp_2p5d_bins=future_tcp_2p5d_bins,
+                    future_tcp_2p5d_bins_mask=future_tcp_2p5d_bins_mask,
+                    tcp_maps=tcp_maps,
                 )
+                loss, proj_loss, aux_logs = loss_out
 
                 loss_mean = loss.mean()
                 proj_loss_mean = proj_loss.mean()
@@ -464,7 +505,7 @@ def train(args, logger):
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
-                
+
                 progress_bar.update(1)
                 global_step += 1
 
@@ -475,7 +516,10 @@ def train(args, logger):
                     logger.info(f"Saved state to {save_path}")
 
 
-            logs = {"loss": loss.detach().item(), "proj_loss": (proj_loss_mean* args.proj_coeff).detach().item(),"acloss": loss_mean.detach().item() }
+            logs = {"loss": loss.detach().item(), "proj_loss": (proj_loss_mean* args.proj_coeff).detach().item(), "acloss": loss_mean.detach().item()}
+            if aux_logs:
+                for k, v in aux_logs.items():
+                    logs[k] = v.detach().item() if hasattr(v, "detach") else v
             progress_bar.set_postfix(**logs)
             logs.update(loss_for_log)
             accelerator.log(logs, step=global_step)

@@ -371,6 +371,28 @@ def parse_args(input_args=None):
         help="The number of the future step to use for the future image.",
     )
     parser.add_argument(
+        "--wm_input_type",
+        type=str,
+        default="future_image",
+        choices=["future_image", "tcp_2p5d", "rgb"],
+        required=False,
+        help="Condition input type for world-model mid-training.",
+    )
+    parser.add_argument(
+        "--wm_target_type",
+        type=str,
+        default="future_image",
+        choices=["future_image", "tcp_2p5d_10bin", "tcp_2p5d_aggregate"],
+        required=False,
+        help="Future auxiliary target type.",
+    )
+    parser.add_argument("--wm_target_camera", type=str, default="cam_high", required=False)
+    parser.add_argument("--tcp_history_size", type=int, default=2, required=False)
+    parser.add_argument("--future_bins", type=int, default=10, required=False)
+    parser.add_argument("--future_bin_size", type=int, default=3, required=False)
+    parser.add_argument("--heatmap_loss_weight", type=float, default=1.0, required=False)
+    parser.add_argument("--depth_loss_weight", type=float, default=0.5, required=False)
+    parser.add_argument(
         "--train_only_learnable_tokens",
         action="store_true",
         help="If set, freezes the entire RDT model and adaptors, then only trains the learnable tokens."
