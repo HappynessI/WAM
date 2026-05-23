@@ -38,6 +38,9 @@ FUTURE_BINS=$(python scripts/read_yaml.py "$CONFIG_FILE" future_bins)
 FUTURE_BIN_SIZE=$(python scripts/read_yaml.py "$CONFIG_FILE" future_bin_size)
 HEATMAP_LOSS_WEIGHT=$(python scripts/read_yaml.py "$CONFIG_FILE" heatmap_loss_weight)
 DEPTH_LOSS_WEIGHT=$(python scripts/read_yaml.py "$CONFIG_FILE" depth_loss_weight)
+PRECOMPUTE_LANG=$(python scripts/read_yaml.py "$CONFIG_FILE" precompute_lang_embeddings)
+LANG_EMBED_DESC_TYPES=$(python scripts/read_yaml.py "$CONFIG_FILE" lang_embed_desc_types)
+LANG_EMBED_BATCH_SIZE=$(python scripts/read_yaml.py "$CONFIG_FILE" lang_embed_batch_size)
 
 PRETRAINED_MODEL_NAME=$(echo "$PRETRAINED_MODEL_NAME" | tr -d '"')
 CUDA_USE=$(echo "$CUDA_USE" | tr -d '"')
@@ -53,6 +56,14 @@ else
 fi
 
 export CUDA_VISIBLE_DEVICES=$CUDA_USE
+
+if [ "$PRECOMPUTE_LANG" = "True" ] || [ "$PRECOMPUTE_LANG" = "true" ]; then
+  python scripts/precompute_robotwin_lang_embeds.py \
+    --model_config_path=$CONFIG_FILE \
+    --text_encoder=$TEXT_ENCODER_NAME \
+    --desc_types=$LANG_EMBED_DESC_TYPES \
+    --batch_size=$LANG_EMBED_BATCH_SIZE
+fi
 
 python -m data.compute_dataset_stat_hdf5 --task_name $CONFIG_NAME --wm_horizon 30
 
@@ -76,6 +87,7 @@ accelerate launch --main_process_port=28499 --multi_gpu --num_processes=2 main_m
     --state_noise_snr=$STATE_NOISE_SNR \
     --load_from_hdf5 \
     --report_to=wandb \
+    --precomp_lang_embed \
     --gradient_accumulation_steps=$GRAD_ACCUM_STEPS \
     --model_config_path=$CONFIG_FILE \
     --CONFIG_NAME=$CONFIG_NAME \

@@ -32,3 +32,6 @@ use_contact_target: false
 proj_coeff: 0.05
 heatmap_loss_weight: 1.0
 depth_loss_weight: 0.5
+precompute_lang_embeddings: true
+lang_embed_desc_types: seen
+lang_embed_batch_size: 16

@@ -265,12 +265,17 @@ class HDF5VLADataset:
 
             # Load the instruction
             dir_path = os.path.dirname(file_path)
-            instructions_path = os.path.join(dir_path, "instructions")
-            if not os.path.isdir(instructions_path) and "source_dataset_root" in f.attrs:
-                instructions_path = os.path.join(str(f.attrs["source_dataset_root"]), "instructions")
+            candidate_instruction_dirs = [
+                os.path.join(dir_path, "instructions"),
+                os.path.join(os.path.dirname(dir_path), "instructions"),
+            ]
+            if "source_dataset_root" in f.attrs:
+                candidate_instruction_dirs.append(os.path.join(str(f.attrs["source_dataset_root"]), "instructions"))
             instructions_names = []
             instruction_texts = []
-            if os.path.isdir(instructions_path):
+            for instructions_path in candidate_instruction_dirs:
+                if not os.path.isdir(instructions_path):
+                    continue
                 for filename in os.listdir(instructions_path):
                     file_path_for_instruction = os.path.join(instructions_path, filename)
                     if filename.endswith(".pt"):
@@ -286,6 +291,8 @@ class HDF5VLADataset:
                                         instruction_texts.extend([v for v in values if isinstance(v, str)])
                         except Exception:
                             pass
+                if instructions_names:
+                    break
             if instructions_names:
                 instruction = str(np.random.choice(instructions_names))
             elif instruction_texts:
