@@ -10,8 +10,7 @@ export TEXT_ENCODER_NAME="../weights/RDT/t5-v1_1-xxl"
 export VISION_ENCODER_NAME="../weights/RDT/siglip-so400m-patch14-384"
 export CFLAGS="-I/usr/include"
 export LDFLAGS="-L/usr/lib/x86_64-linux-gnu"
-export WANDB_PROJECT="WAM_HEATMAP_DEPTH"
-export WANDB_DEFAULT_RUN_NAME=$CONFIG_NAME
+export WANDB_DISABLED=true
 
 if [ ! -f "$CONFIG_FILE" ]; then
   echo "Config file $CONFIG_FILE does not exist!"
@@ -86,7 +85,7 @@ accelerate launch --main_process_port=28499 --multi_gpu --num_processes=2 main_m
     --dataset_type="finetune" \
     --state_noise_snr=$STATE_NOISE_SNR \
     --load_from_hdf5 \
-    --report_to=wandb \
+    --report_to=tensorboard \
     --precomp_lang_embed \
     --gradient_accumulation_steps=$GRAD_ACCUM_STEPS \
     --model_config_path=$CONFIG_FILE \
