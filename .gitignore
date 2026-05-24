@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.so
+.DS_Store
+
+# Runtime outputs
+checkpoints/
+eval_result/
+logs/
+wandb/
+outputs/
+processed_data/
+
+# Large model/data artifacts
+weights/
+*.bin
+*.safetensors
+*.ckpt
+*.pth
+*.hdf5
+*.npy
+*.npz
+*.mp4
+
+# Reference docs are intentionally kept out of this slim code mirror.
+*.md
