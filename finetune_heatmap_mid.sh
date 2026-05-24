@@ -6,7 +6,7 @@ CONFIG_FILE="model_config/$CONFIG_NAME.yml"
 
 echo "CONFIG_FILE_PATH: $CONFIG_FILE"
 
-export TEXT_ENCODER_NAME="google/t5-v1_1-xxl"
+export TEXT_ENCODER_NAME="../weights/RDT/t5-v1_1-xxl"
 export VISION_ENCODER_NAME="../weights/RDT/siglip-so400m-patch14-384"
 export CFLAGS="-I/usr/include"
 export LDFLAGS="-L/usr/lib/x86_64-linux-gnu"

@@ -113,12 +113,12 @@ def parse_args(input_args=None):
         type=str,
         default=None,
         help=(
-            "Path or name of a pretrained checkpoint to load the model from.\n",
+            "Path or name of a pretrained checkpoint to load the model from.\n"
             "   This can be either:\n"
             "   - a string, the *model id* of a pretrained model hosted inside a model repo on huggingface.co, e.g., `robotics-diffusion-transformer/rdt-1b`,\n"
             "   - a path to a *directory* containing model weights saved using [`~RDTRunner.save_pretrained`] method, e.g., `./my_model_directory/`.\n"
             "   - a path to model checkpoint (*.pt), .e.g, `my_model_directory/checkpoint-10000/pytorch_model/mp_rank_00_model_states.pt`"
-            "   - `None` if you are randomly initializing model using configuration at `config_path`.",
+            "   - `None` if you are randomly initializing model using configuration at `config_path`."
         ),
     )
     parser.add_argument(
