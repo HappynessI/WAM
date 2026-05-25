@@ -9,7 +9,6 @@ from huggingface_hub.utils import EntryNotFoundError, is_torch_available
 import torch
 import torch.nn.functional as F
 
-from peft import PeftModel
 
 class CompatiblePyTorchModelHubMixin(PyTorchModelHubMixin):
     """Mixin class to load Pytorch models from the Hub."""

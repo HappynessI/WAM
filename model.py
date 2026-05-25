@@ -38,6 +38,7 @@ from scripts.agilex_model import create_model
 from multimodal_encoder.t5_encoder import T5Embedder
 
 global_path = parent_dir.parent
+DEFAULT_ENCODER_WEIGHTS_ROOT = os.environ.get("FRAPPE_RDT_WEIGHTS_ROOT", "/data1/weights/RDT")
 
 
 class RDT:
@@ -49,16 +50,23 @@ class RDT:
         left_arm_dim,
         right_arm_dim,
         rdt_step,
+        ema_model_path=None,
+        encoder_weights_root=None,
     ):
         # set path
         current_file = Path(__file__)
-        self.global_path = current_file.parent.parent
+        self.global_path = Path(os.environ.get("FRAPPE_POLICY_ROOT", current_file.parent.parent)).resolve()
+        self.encoder_weights_root = self._resolve_encoder_weights_root(encoder_weights_root)
+        runtime_config = self._load_runtime_config(pretrained_model_name_or_path)
+        img_history_size = self._infer_img_history_size(runtime_config)
+        pred_horizon = self._infer_pred_horizon(runtime_config)
         # load the config
         self.config = {
             "episode_len": 10000,  # args.max_publish_step
             "state_dim": left_arm_dim + 1 + right_arm_dim +
             1,  # 14 dims action:[left joint angles,left gripper,right joint angles,right gripper]
-            "chunk_size": 64,  # args.chunk_size
+            "chunk_size": pred_horizon,
+            "img_history_size": img_history_size,
             "camera_names": ["cam_high", "cam_right_wrist", "cam_left_wrist"],
         }
         # setup config
@@ -66,10 +74,11 @@ class RDT:
             "max_publish_step": 10000,  # Maximum number of action publishing steps
             "seed": None,  # Random seed
             "ctrl_freq": 25,  # The control frequency of the robot
-            "chunk_size": 64,  # Action chunk size
+            "chunk_size": pred_horizon,  # Action chunk size
             # 'disable_puppet_arm': False,  # Whether to disable the puppet arm
-            "config_path": os.path.join(self.global_path, "RDT/configs/base.yaml"),
+            "config_path": os.path.join(self.global_path, "frappe/configs/robotwin_contact_base.yaml"),
             "pretrained_model_name_or_path": pretrained_model_name_or_path,
+            "ema_model_path": ema_model_path,
         }
 
         # Load rdt model
@@ -77,23 +86,80 @@ class RDT:
         self.policy = self.make_policy(self.args)
         self.max_publish_step = self.config["episode_len"]
         self.chunk_size = self.config["chunk_size"]
+        self.img_history_size = self.config["img_history_size"]
         self.task_name = task_name
         self.observation_window = None
         self.img_size = (640, 480)
         self.set_language_embed()
         self.rdt_step = rdt_step
 
+    def _load_runtime_config(self, pretrained_model_name_or_path):
+        config_path = None
+        if pretrained_model_name_or_path is not None and os.path.isdir(pretrained_model_name_or_path):
+            candidate = os.path.join(pretrained_model_name_or_path, "config.json")
+            if os.path.isfile(candidate):
+                config_path = candidate
+        if config_path is None:
+            candidate = os.path.join(self.global_path, "frappe/configs/robotwin_contact_base.yaml")
+            if os.path.isfile(candidate):
+                with open(candidate, "r") as fp:
+                    return yaml.safe_load(fp)
+            return {}
+
+        with open(config_path, "r") as fp:
+            return json.load(fp)
+
+    @staticmethod
+    def _infer_img_history_size(runtime_config):
+        if "common" in runtime_config:
+            return int(runtime_config["common"].get("img_history_size", 1))
+
+        img_pos_embed_config = runtime_config.get("img_pos_embed_config", [])
+        if img_pos_embed_config:
+            _, shape = img_pos_embed_config[0]
+            if isinstance(shape, (list, tuple)) and len(shape) >= 1:
+                return int(shape[0])
+        return 1
+
+    @staticmethod
+    def _infer_pred_horizon(runtime_config):
+        if "common" in runtime_config:
+            return int(runtime_config["common"].get("action_chunk_size", 64))
+        return int(runtime_config.get("pred_horizon", 64))
+
+    def _resolve_encoder_weights_root(self, encoder_weights_root):
+        candidates = [
+            encoder_weights_root,
+            os.environ.get("RDT_WEIGHTS_ROOT"),
+            os.environ.get("FRAPPE_RDT_WEIGHTS_ROOT"),
+            DEFAULT_ENCODER_WEIGHTS_ROOT,
+            os.path.join(self.global_path, "skele-wam/weights"),
+        ]
+        for candidate in candidates:
+            if candidate and os.path.isdir(candidate):
+                print(f"Using encoder weights from: {candidate}")
+                return candidate
+        raise FileNotFoundError(
+            "Could not find encoder weights root. Checked: "
+            + ", ".join(str(candidate) for candidate in candidates if candidate)
+        )
+
+    def _require_encoder_path(self, name):
+        path = os.path.join(self.encoder_weights_root, name)
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f"Missing encoder weights at: {path}")
+        return path
+
     # set img_size
     def set_img_size(self, img_size):
         self.img_size = img_size
 
     def set_language_embed(self):
-        GPU = 0
-        MODEL_PATH = os.path.join(self.global_path, "weights/RDT/t5-v1_1-xxl")
-        CONFIG_PATH = os.path.join(self.global_path, "RDT/configs/base.yaml")
+        MODEL_PATH = self._require_encoder_path("t5-v1_1-xxl")
+        CONFIG_PATH = os.path.join(self.global_path, "frappe/configs/robotwin_contact_base.yaml")
         with open(CONFIG_PATH, "r") as fp:
             config = yaml.safe_load(fp)
-        device = torch.device(f"cuda:{GPU}")
+        device = torch.device(self.policy.device)
         text_embedder = T5Embedder(
             from_pretrained=MODEL_PATH,
             model_max_length=config["dataset"]["tokenizer_max_length"],
@@ -159,17 +225,7 @@ class RDT:
             return cv2.resize(img, size)
 
         if self.observation_window is None:
-            self.observation_window = deque(maxlen=2)
-
-            # Append the first dummy image
-            self.observation_window.append({
-                "qpos": None,
-                "images": {
-                    self.config["camera_names"][0]: None,
-                    self.config["camera_names"][1]: None,
-                    self.config["camera_names"][2]: None,
-                },
-            })
+            self.observation_window = deque(maxlen=self.img_history_size)
 
         img_front, img_right, img_left, puppet_arm = (
             img_arr[0],
@@ -187,7 +243,7 @@ class RDT:
         img_right = jpeg_mapping(img_right)
 
         qpos = np.array(puppet_arm)
-        qpos = torch.from_numpy(qpos).float().cuda()
+        qpos = torch.from_numpy(qpos).float().to(torch.device(self.policy.device))
         self.observation_window.append({
             "qpos": qpos,
             "images": {
@@ -203,7 +259,12 @@ class RDT:
             self.update_observation_window(img_arr, state)
 
         with torch.inference_mode():
-            action_buffer = inference_fn(self.config, self.policy, self.lang_embeddings, self.observation_window).copy()
+            action_buffer = inference_fn(
+                self.config,
+                self.policy,
+                self.lang_embeddings,
+                self.observation_window,
+            ).copy()
 
         return action_buffer
 
@@ -222,11 +283,12 @@ class RDT:
             "right_arm_dim": self.right_arm_dim,
         }
         # pretrained_text_encoder_name_or_path = "weights/RDT/t5-v1_1-xxl"
-        pretrained_vision_encoder_name_or_path = os.path.join(self.global_path, "weights/RDT/siglip-so400m-patch14-384")
+        pretrained_vision_encoder_name_or_path = self._require_encoder_path("siglip-so400m-patch14-384")
         model = create_model(
             args=args["config"],
             dtype=torch.bfloat16,
             pretrained=args["pretrained_model_name_or_path"],
+            ema_model_path=args.get("ema_model_path"),
             # pretrained_text_encoder_name_or_path=pretrained_text_encoder_name_or_path,
             pretrained_vision_encoder_name_or_path=pretrained_vision_encoder_name_or_path,
             control_frequency=args["ctrl_freq"],
@@ -242,20 +304,26 @@ def inference_fn(config, policy, lang_embeddings, observation_window):
     while True:
         time1 = time.time()
 
-        # fetch images in sequence [front, right, left]
-        image_arrs = [
-            observation_window[-2]["images"][config["camera_names"][0]],
-            observation_window[-2]["images"][config["camera_names"][1]],
-            observation_window[-2]["images"][config["camera_names"][2]],
-            observation_window[-1]["images"][config["camera_names"][0]],
-            observation_window[-1]["images"][config["camera_names"][1]],
-            observation_window[-1]["images"][config["camera_names"][2]],
-        ]
+        padded_window = list(observation_window)
+        while len(padded_window) < config.get("img_history_size", 1):
+            padded_window.insert(0, {
+                "qpos": None,
+                "images": {
+                    camera_name: None for camera_name in config["camera_names"]
+                },
+            })
+        padded_window = padded_window[-config.get("img_history_size", 1):]
+
+        # Fetch images in [t-h+1, ..., t] x [front, right, left] order.
+        image_arrs = []
+        for frame in padded_window:
+            for camera_name in config["camera_names"]:
+                image_arrs.append(frame["images"][camera_name])
 
         images = [PImage.fromarray(arr) if arr is not None else None for arr in image_arrs]
 
         # get last qpos in shape [14, ]
-        proprio = observation_window[-1]["qpos"]
+        proprio = padded_window[-1]["qpos"]
         # unsqueeze to [1, 14]
         proprio = proprio.unsqueeze(0)
 

@@ -16,8 +16,6 @@ sys.path.append(os.path.join(current_file.parent.parent, "models"))
 from multimodal_encoder.siglip_encoder import SiglipVisionTower
 from multimodal_encoder.t5_encoder import T5Embedder
 from rdt_runner import RDTRunner
-from accelerate import Accelerator
-from inference_runner import MOERDTRunner
 # The indices that the raw vector should be mapped to in the unified action vector
 # AGILEX_STATE_INDICES = [
 #     STATE_VEC_IDX_MAPPING[f"left_arm_joint_{i}_pos"] for i in range(1)
@@ -29,6 +27,13 @@ from inference_runner import MOERDTRunner
 #     STATE_VEC_IDX_MAPPING[f"right_gripper_open"]
 # ]
 # AGILEX_STATE_INDICES = None
+
+
+def _load_moe_runner():
+    from accelerate import Accelerator
+    from inference_runner import MOERDTRunner
+
+    return Accelerator, MOERDTRunner
 
 
 # Create the RDT model
@@ -91,13 +96,18 @@ class RoboticDiffusionTransformerModel(object):
 
     def get_policy(self, pretrained):
         """Initialize the model."""
-        # Initialize model with arguments
         if pretrained is None or os.path.isfile(pretrained):
             img_cond_len = (self.args["common"]["img_history_size"] * self.args["common"]["num_cameras"] *
                             self.vision_model.num_patches)
+            heatmap_enabled = bool(self.args["common"].get("heatmap_enabled", False))
+            heatmap_size = self.args["common"].get("heatmap_size", [48, 64])
+            action_dim = (
+                self.args["common"].get("action_state_dim", self.args["common"]["state_dim"])
+                if heatmap_enabled else self.args["common"].get("continuous_target_dim", self.args["common"]["state_dim"])
+            )
 
             _model = RDTRunner(
-                action_dim=self.args["common"]["state_dim"],
+                action_dim=action_dim,
                 pred_horizon=self.args["common"]["action_chunk_size"],
                 config=self.args["model"],
                 lang_token_dim=self.args["model"]["lang_token_dim"],
@@ -106,8 +116,6 @@ class RoboticDiffusionTransformerModel(object):
                 max_lang_cond_len=self.args["dataset"]["tokenizer_max_length"],
                 img_cond_len=img_cond_len,
                 img_pos_embed_config=[
-                    # No initial pos embed in the last grid size
-                    # since we've already done in ViT
                     (
                         "image",
                         (
@@ -118,21 +126,33 @@ class RoboticDiffusionTransformerModel(object):
                     ),
                 ],
                 lang_pos_embed_config=[
-                    # Similarly, no initial pos embed for language
                     ("lang", -self.args["dataset"]["tokenizer_max_length"]),
                 ],
                 dtype=self.dtype,
+                contact_flag_dim=self.args["common"].get("contact_flag_dim", 0),
+                action_state_dim=self.args["common"].get("action_state_dim", self.args["common"]["state_dim"]),
+                hand_points_dim=(0 if heatmap_enabled else self.args["common"].get("hand_points_dim", 0)),
+                contact_point_dim=(0 if heatmap_enabled else self.args["common"].get("contact_point_dim", 0)),
+                heatmap_channels=(self.args["common"].get("heatmap_channels", 0) if heatmap_enabled else 0),
+                heatmap_height=(int(heatmap_size[0]) if heatmap_enabled else 0),
+                heatmap_width=(int(heatmap_size[1]) if heatmap_enabled else 0),
+                heatmap_horizon=(
+                    self.args["common"].get("heatmap_horizon", self.args["common"]["action_chunk_size"])
+                    if heatmap_enabled else 0
+                ),
             )
-        else:
-            temp_accelerator = Accelerator()         
-            config_path = os.path.join(pretrained, "config.json")
-            with open(config_path, 'r') as f:
-                pretrained_config = json.load(f)
-            
-            expert_configs = pretrained_config["expert_configs"]
+            return _model
+
+        config_path = os.path.join(pretrained, "config.json")
+        with open(config_path, 'r') as f:
+            pretrained_config = json.load(f)
+
+        if "expert_configs" in pretrained_config:
+            Accelerator, MOERDTRunner = _load_moe_runner()
+            temp_accelerator = Accelerator()
             _model = MOERDTRunner.from_pretrained(
                 pretrained,
-                expert_configs=expert_configs,
+                expert_configs=pretrained_config["expert_configs"],
                 action_dim=pretrained_config["action_dim"],
                 pred_horizon=pretrained_config["pred_horizon"],
                 lang_token_dim=pretrained_config["lang_token_dim"],
@@ -146,11 +166,13 @@ class RoboticDiffusionTransformerModel(object):
                 resolution=pretrained_config["resolution"],
                 use_lora=True,
                 lora_config=pretrained_config["lora_config"],
-                accelerator=temp_accelerator
+                accelerator=temp_accelerator,
             )
             for expert in _model.experts:
                 expert.model = expert.model.merge_and_unload()
-        return _model
+            return _model
+
+        return RDTRunner.from_pretrained(pretrained)
 
     def get_text_encoder(self, pretrained_text_encoder_name_or_path):
         text_embedder = T5Embedder(
@@ -171,19 +193,68 @@ class RoboticDiffusionTransformerModel(object):
         device = self.device
         weight_dtype = self.dtype
         self.policy.eval()
-        # self.text_model.eval()
         self.vision_model.eval()
 
         self.policy = self.policy.to(device, dtype=weight_dtype)
-        # self.text_model = self.text_model.to(device, dtype=weight_dtype)
-        for expert in self.policy.experts:
-            expert.model = torch.compile(expert.model)
+        if hasattr(self.policy, "experts"):
+            for expert in self.policy.experts:
+                expert.model = torch.compile(expert.model)
         self.vision_model = self.vision_model.to(device, dtype=weight_dtype)
 
     def load_pretrained_weights(self, pretrained=None):
         if pretrained is None:
             return
         print(f"Loading weights from {pretrained}")
+        if os.path.isdir(pretrained):
+            config_path = os.path.join(pretrained, "config.json")
+            safetensors_path = os.path.join(pretrained, "model.safetensors")
+            pt_path = os.path.join(pretrained, "pytorch_model.bin")
+            if not os.path.exists(config_path):
+                if os.path.isfile(safetensors_path):
+                    from safetensors.torch import load_model
+
+                    load_model(self.policy, safetensors_path)
+                    self.policy = self.policy.to(self.device, dtype=self.dtype)
+                    self.policy.eval()
+                    return
+                if os.path.isfile(pt_path):
+                    checkpoint = torch.load(pt_path, map_location="cpu")
+                    self.policy.load_state_dict(checkpoint.get("module", checkpoint), strict=False)
+                    self.policy = self.policy.to(self.device, dtype=self.dtype)
+                    self.policy.eval()
+                    return
+                raise FileNotFoundError(f"No loadable weights found under {pretrained}")
+            with open(config_path, 'r') as f:
+                pretrained_config = json.load(f)
+            if "expert_configs" in pretrained_config:
+                Accelerator, MOERDTRunner = _load_moe_runner()
+                temp_accelerator = Accelerator()
+                self.policy = MOERDTRunner.from_pretrained(
+                    pretrained,
+                    expert_configs=pretrained_config["expert_configs"],
+                    action_dim=pretrained_config["action_dim"],
+                    pred_horizon=pretrained_config["pred_horizon"],
+                    lang_token_dim=pretrained_config["lang_token_dim"],
+                    img_token_dim=pretrained_config["img_token_dim"],
+                    state_token_dim=pretrained_config["state_token_dim"],
+                    max_lang_cond_len=pretrained_config["max_lang_cond_len"],
+                    img_cond_len=pretrained_config["img_cond_len"],
+                    lang_pos_embed_config=pretrained_config["lang_pos_embed_config"],
+                    img_pos_embed_config=pretrained_config["img_pos_embed_config"],
+                    dtype=self.dtype,
+                    resolution=pretrained_config["resolution"],
+                    use_lora=True,
+                    lora_config=pretrained_config["lora_config"],
+                    accelerator=temp_accelerator,
+                )
+                for expert in self.policy.experts:
+                    expert.model = expert.model.merge_and_unload()
+            else:
+                self.policy = RDTRunner.from_pretrained(pretrained)
+            self.policy = self.policy.to(self.device, dtype=self.dtype)
+            self.policy.eval()
+            return
+
         filename = os.path.basename(pretrained)
         if filename.endswith(".pt"):
             checkpoint = torch.load(pretrained)
@@ -364,14 +435,27 @@ class RoboticDiffusionTransformerModel(object):
         text_embeds = text_embeds.to(device, dtype=dtype)
 
         # Predict the next action chunk given the inputs
-        trajectory = self.policy.predict_action(
+        target_dim = int(
+            getattr(
+                self.policy,
+                "total_target_dim",
+                self.args["common"].get("continuous_target_dim", self.args["common"]["state_dim"]),
+            )
+        )
+        action_mask = torch.ones((state_elem_mask.shape[0], target_dim), device=device, dtype=dtype)
+        action_mask[:, :state_elem_mask.shape[1]] = state_elem_mask
+
+        prediction = self.policy.predict_action(
             lang_tokens=text_embeds,
             lang_attn_mask=torch.ones(text_embeds.shape[:2], dtype=torch.bool, device=text_embeds.device),
             img_tokens=image_embeds,
             state_tokens=states,
-            action_mask=state_elem_mask.unsqueeze(1),
+            state_mask=state_elem_mask,
+            action_mask=action_mask.unsqueeze(1),
             ctrl_freqs=ctrl_freqs,
+            return_dict=True,
         )
+        trajectory = prediction["trajectory"] if isinstance(prediction, dict) else prediction
         trajectory = self._unformat_action_to_joint(trajectory).to(torch.float32)
 
         return trajectory
